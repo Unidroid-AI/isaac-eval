@@ -1,0 +1,281 @@
+# Copyright (c) 2026, Unidroid
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Expand an EnvHub bundle and run one Isaac process per GPU.
+
+This process does not start Isaac Sim. ``scripts/evaluate.py`` calls it when
+the config says ``runtime: brain``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+import yaml
+
+from isaac_eval.benchmark.aggregate import score_records, write_outputs
+from isaac_eval.benchmark.expand import expand, make_shards
+from isaac_eval.benchmark.manifest import load_manifest
+from isaac_eval.benchmark.packing import pack_key_for
+from isaac_eval.benchmark.scheduler import UnitFailed, group_shards, plan_slots, plan_units, run_queue
+from isaac_eval.domain.config import EvalConfig
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the brain evaluation described by ``--config``."""
+    parser = argparse.ArgumentParser(description="Evaluate a brain submission")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--manifest", default=None, help="Override the bundle's benchmark.yaml.")
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--result-path", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+
+    config = EvalConfig.from_yaml(args.config)
+    config.validate()
+    manifest_path = Path(args.manifest) if args.manifest else _manifest_from_envhub(config)
+    manifest = load_manifest(manifest_path)
+    output_dir = _output_dir(args.output_dir, config.log_dir)
+    started = time.perf_counter()
+    records = run_workers(config, manifest, output_dir)
+    print(wall_summary(records), flush=True)
+    score, metrics, report = score_records(
+        records,
+        config.task_type,
+        config.scoring_version,
+        _step_cap(config),
+        max_episode_time_s=config.max_episode_time_s,
+    )
+    metadata = {
+        "runtime": config.runtime,
+        "task_name": config.task_name,
+        "benchmark_env_id": config.benchmark_env_id,
+        "scoring_version": config.scoring_version,
+        "version": manifest.version,
+        "num_episodes": config.num_episodes,
+        "max_episode_steps": _step_cap(config),
+        "max_episode_time_s": config.max_episode_time_s,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+    write_outputs(
+        output_dir,
+        score,
+        metrics,
+        report=report,
+        metadata=metadata,
+    )
+    for path in output_dir.glob("gpu*.jsonl"):
+        path.unlink()
+    _write_config(output_dir, config)
+    print((output_dir / "summary.txt").read_text(encoding="utf-8"), end="")
+    print(f"\nResults saved to log directory: {output_dir}")
+    print(f"  - JSON: {output_dir / 'results.json'}")
+    print(f"  - Summary: {output_dir / 'summary.txt'}")
+    print(f"  - Config: {output_dir / 'config.yaml'}")
+    print(f"  - Result: {output_dir / 'evaluation_result.json'}")
+    if args.result_path:
+        target = Path(args.result_path)
+        target.write_text((output_dir / "evaluation_result.json").read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"  - Result copy: {target}")
+
+
+def wall_summary(records: list[dict]) -> str:
+    """Seconds spent per phase, summed over shards. Records of one shard share a ``wall`` entry."""
+    shards: dict[str, dict] = {}
+    for record in records:
+        wall = record.get("wall")
+        if wall:
+            shards.setdefault(str(wall.get("shard")), wall)
+    totals = {"reset_s": 0.0, "obs_s": 0.0, "brain_wait_s": 0.0, "step_s": 0.0}
+    for wall in shards.values():
+        for key in totals:
+            totals[key] += float(wall.get(key, 0.0))
+    parts = ", ".join(f"{key[:-2]} {value:.1f}s" for key, value in totals.items())
+    return f"[INFO] Worker seconds over {len(shards)} shard runs: {parts}."
+
+
+def run_directory(log_dir: Path, timestamp: datetime | None = None) -> Path:
+    """Create ``log_dir/eval_run_YYYYMMDD_HHMMSS``, matching the checkpoint evaluator."""
+    stamp = (timestamp or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    path = Path(log_dir) / f"eval_run_{stamp}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _output_dir(explicit: str | None, log_dir: str | None) -> Path:
+    """Use an explicit directory as given. Otherwise open a new run folder under ``log_dir``."""
+    base = Path(explicit or log_dir or "logs/eval")
+    if not base.is_absolute():
+        base = (Path.cwd() / base).resolve()
+    if explicit:
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    return run_directory(base)
+
+
+def _write_config(output_dir: Path, config: EvalConfig) -> None:
+    """Save the eval config next to the report. ``log_dir`` stays the parent, not the run folder."""
+    with open(output_dir / "config.yaml", "w", encoding="utf-8", errors="replace") as handle:
+        yaml.dump(config.to_dict(), handle, default_flow_style=False, allow_unicode=True)
+
+
+def run_workers(config: EvalConfig, manifest, output_dir: Path) -> list[dict]:
+    """Expand, schedule, and collect JSONL records.
+
+    Units of work sit in one queue. Each GPU takes the next unit when it is idle,
+    so a slow scene does not hold up the others.
+    """
+    jobs = expand(manifest, config.num_episodes)
+    shards = make_shards(jobs, manifest.shard_size, pack_key_for(manifest), mixed=manifest.pack_by == "background")
+    groups = group_shards(shards)
+    placement = str((config.brain or {}).get("placement", "paired"))
+    slots = plan_slots(placement)
+    units = plan_units(groups, len(slots))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    active = slots[: len(units)]
+    replicas = max((slot.brain_index for slot in active), default=0) + 1
+    devices = ", ".join(slot.device_id for slot in active)
+    print(
+        f"[INFO] Isaac workers: {len(active)} on GPU {devices}. Brain replicas: {replicas}. "
+        f"{len(groups)} scene builds in {len(units)} units for {len(jobs)} episodes.",
+        flush=True,
+    )
+    counter = itertools.count()
+    counter_lock = threading.Lock()
+    deadline = time.monotonic() + config.timeout_seconds if config.timeout_seconds else None
+
+    def run_unit(slot, unit, attempt: int) -> list[dict]:
+        with counter_lock:
+            number = next(counter)
+        path = output_dir / f"gpu{slot.device_id}-{number:03d}.jsonl"
+        return _run_process(config, unit, path, slot, deadline)
+
+    return run_queue(active, units, run_unit)
+
+
+def _run_process(config: EvalConfig, bucket, output_path: Path, slot, deadline: float | None = None) -> list[dict]:
+    """One Isaac process for one unit of scene groups.
+
+    Raises:
+        UnitFailed: The process failed. The exception carries the groups it finished.
+        TimeoutError: ``deadline`` (``time.monotonic``) passed. The process is killed.
+    """
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
+        raise TimeoutError(f"evaluation exceeded timeout of {config.timeout_seconds}s")
+    payload = {
+        "device": "cuda:0",
+        "visible_device": slot.device_id,
+        "socket": str(Path(config.brain["socket_dir"]) / f"brain-{slot.brain_index}.sock") if config.brain else "",
+        "connect_wait_s": float(config.brain.get("connect_wait_s", 120)) if config.brain else 0.0,
+        "task_module": config.task_module,
+        "task_name": config.task_name,
+        "cfg_entry": (config.env_config or {}).get("cfg_entry"),
+        "benchmark_env_id": config.benchmark_env_id,
+        "open_loop_horizon": int(config.brain["open_loop_horizon"]) if config.brain else 1,
+        "step_timeout_s": float(config.brain["step_timeout_s"]) if config.brain else 30,
+        "max_steps": _step_cap(config),
+        "runtime": config.runtime,
+        "enable_cameras": config.enable_cameras,
+        "policy_path": config.policy_path,
+        "groups": [{"shards": [_shard_payload(shard) for shard in group]} for group in bucket],
+    }
+    group_file = tempfile.NamedTemporaryFile(prefix="eval-group-", suffix=".json", delete=False)
+    group_path = Path(group_file.name)
+    group_file.close()
+    group_path.write_text(json.dumps(payload), encoding="utf-8")
+    cli = Path(sys.argv[0]).resolve()
+    child_env = os.environ.copy()
+    child_env["CUDA_VISIBLE_DEVICES"] = slot.device_id
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(cli), "--worker", "--group", str(group_path), "--output", str(output_path)],
+            check=False,
+            env=child_env,
+            timeout=remaining,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"evaluation exceeded timeout of {config.timeout_seconds}s") from exc
+    finally:
+        group_path.unlink(missing_ok=True)
+    records = _read_records(output_path)
+    if completed.returncode != 0 or not output_path.is_file():
+        task_id = bucket[0][0].task_id if bucket else "unknown"
+        raise UnitFailed(
+            f"evaluation worker failed for GPU {slot.device_id} with code {completed.returncode} "
+            f"starting at {task_id}",
+            records,
+        )
+    return records
+
+
+def _read_records(path: Path) -> list[dict]:
+    """Records of the groups a worker finished. A missing file or a torn last line is skipped."""
+    if not path.is_file():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            break
+    return records
+
+
+DEFAULT_MAX_EPISODE_STEPS = 400
+"""Brain-mode step cap when the eval config omits ``max_episode_steps``."""
+
+
+def _step_cap(config: EvalConfig) -> int:
+    """Step cap for every group, and the step budget its score is normalized against."""
+    return int(config.max_episode_steps or DEFAULT_MAX_EPISODE_STEPS)
+
+
+def _shard_payload(shard) -> dict:
+    return {
+        "task_id": shard.task_id,
+        "scene_id": shard.scene_id,
+        "composer": shard.composer,
+        "variant": shard.variant,
+        "pose_jitter_m": shard.pose_jitter_m,
+        "pack": shard.pack,
+        "mixed": shard.mixed,
+        "jobs": [
+            {
+                "job_id": job.job_id,
+                "task_id": job.task_id,
+                "scene_id": job.scene_id,
+                "composer": job.composer,
+                "variant": job.variant,
+                "pose_jitter_m": job.pose_jitter_m,
+                "instruction_id": job.instruction_id,
+                "episode_index": job.episode_index,
+                "seed": job.seed,
+                "instruction": job.instruction,
+            }
+            for job in shard.jobs
+        ],
+    }
+
+
+def _manifest_from_envhub(config: EvalConfig) -> Path:
+    from nepher import load_env
+
+    env = load_env(config.benchmark_env_id, category=config.category)
+    path = Path(env.cache_path) / "benchmark.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(f"bundle {config.benchmark_env_id} has no benchmark.yaml")
+    return path

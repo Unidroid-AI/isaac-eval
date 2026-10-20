@@ -1,0 +1,367 @@
+# Copyright (c) 2026, Unidroid
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Configuration system for evaluation campaigns."""
+
+from __future__ import annotations
+
+import importlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass
+class EvalConfig:
+    """Configuration for an evaluation campaign.
+
+    Defines the target environment, scene selection, reproducibility seeds,
+    episode parameters, and — crucially — **both** the task type and the
+    scoring version that together identify the exact scorer to use.
+
+    Scorer selection
+    ----------------
+    ``task_type`` identifies the robot/task domain:
+
+    - ``"navigation.leatherback"`` — leatherback and ANYmal B waypoint navigation
+    - ``"navigation.spot"``        — Spot quadruped tasks (waypoint or goal nav)
+    - ``"navigation.humanoid"``    — G1 waypoint race
+    - ``"navigation.humanoid.runjump"`` — G1 obstacle-course HL (time + clear/land + track + safety)
+    - ``"navigation.go2"`` — Go2 LiDAR maze (time vs rated speed + path + stability + envelope)
+    - ``"manipulation.pick_place"`` — Franka high-level pick-and-place
+    - ``"manipulation.multitask"`` — several manipulation families in one benchmark
+
+    ``scoring_version`` selects the algorithm *within* that task type:
+
+    +---------------------------+----------+-----------------------------------------+
+    | task_type                 | versions | description                             |
+    +===========================+==========+=========================================+
+    | navigation.humanoid       | v1       | SR-amplified: time efficiency only      |
+    +---------------------------+----------+-----------------------------------------+
+    | navigation.humanoid.runjump | v1     | SR-amplified: time + clear_land + track + safety |
+    |                           | v2     | SR × mean(N × flat speed/clear/land/track)      |
+    +---------------------------+----------+-----------------------------------------+
+    | navigation.go2            | v1       | SR-amplified: time vs 3.7 m/s + path + stability + envelope |
+    +---------------------------+----------+-----------------------------------------+
+    | navigation.leatherback    | v1       | success (70%) + time (30%)              |
+    |                           | v2       | SR-amplified: time + speed/yaw limits   |
+    +---------------------------+----------+-----------------------------------------+
+    | navigation.spot           | v2       | success + time + locomotion quality     |
+    |                           | v3       | per-episode; fail=0; time+stability     |
+    |                           | v4       | success-rate-amplified + directness     |
+    +---------------------------+----------+-----------------------------------------+
+    | manipulation.pick_place   | v1       | task success (70%) + time (30%)         |
+    |                           | v2       | success_rate × (0.75 + 0.25 × time)     |
+    +---------------------------+----------+-----------------------------------------+
+    | manipulation.multitask    | v1       | 0.70 × progress + 0.30 × finish quality |
+    +---------------------------+----------+-----------------------------------------+
+    """
+
+    # -----------------------------------------------------------------------
+    # Required fields (no default)
+    # -----------------------------------------------------------------------
+
+    task_name: str
+    """Gymnasium task name (e.g. 'Nepher-FrankaTabletop-Envhub-Play-v0')."""
+
+    task_type: str
+    """Task domain that selects the scorer family (see the class docstring)."""
+
+    num_envs: int | None = None
+    """Parallel environment count for an in-process run.
+
+    A brain run sizes each Isaac process from the shard, so this field is unused there.
+    """
+
+    # -----------------------------------------------------------------------
+    # Scoring
+    # -----------------------------------------------------------------------
+
+    scoring_version: str = "v1"
+    """Scoring algorithm version within the task type.
+
+    Each task type supports specific versions — see class docstring for the
+    full matrix.  Setting an invalid combination raises ``ValueError`` in
+    ``validate()``.
+    """
+
+    # -----------------------------------------------------------------------
+    # Environment / scene
+    # -----------------------------------------------------------------------
+
+    task_module: str | None = None
+    """Python module to import for environment registration."""
+
+    env_scenes: list[dict[str, Any]] = field(default_factory=list)
+    """Environment-scene pairs for an in-process checkpoint run.
+    Each dict must have ``'env_id'`` and ``'scene'`` keys.
+    Brain mode uses ``benchmark_env_id`` instead."""
+
+    # -----------------------------------------------------------------------
+    # Reproducibility
+    # -----------------------------------------------------------------------
+
+    seeds: list[int] = field(default_factory=lambda: [42])
+    """Random seeds for deterministic evaluation."""
+
+    # -----------------------------------------------------------------------
+    # Episode parameters
+    # -----------------------------------------------------------------------
+
+    num_episodes: int = 10
+    """Number of episodes to run per scene-seed combination."""
+
+    max_episode_steps: int | None = None
+    """Maximum steps per episode.  If None, uses the environment default."""
+
+    max_episode_time_s: float | None = None
+    """Physical time budget [s]. Multitask v1 uses it as ``T_budget`` for speed.
+    Navigation v3/v4 scorers normalize time efficiency against it as well.
+    If None, multitask speed uses the step count against ``max_episode_steps``."""
+
+    # -----------------------------------------------------------------------
+    # Environment extras
+    # -----------------------------------------------------------------------
+
+    env_config: dict[str, Any] = field(default_factory=dict)
+    """Additional environment configuration (optional)."""
+
+    category: str = "navigation"
+    """EnvHub category: ``'navigation'`` or ``'manipulation'``."""
+
+    enable_cameras: bool = False
+    """When True, the Isaac process enables camera rendering.
+    Required for environments that spawn cameras."""
+
+    # -----------------------------------------------------------------------
+    # Execution
+    # -----------------------------------------------------------------------
+
+    timeout_seconds: float | None = None
+    """Maximum wall-clock time for the entire evaluation.  None = no timeout."""
+
+    # -----------------------------------------------------------------------
+    # Logging
+    # -----------------------------------------------------------------------
+
+    log_dir: str | None = None
+    """Directory for state logs (.npy files per episode/env)."""
+
+    enable_logging: bool = False
+    """Whether to enable state logging.  Requires ``log_dir`` to be set."""
+
+    # -----------------------------------------------------------------------
+    # Policy
+    # -----------------------------------------------------------------------
+
+    policy_path: str | None = None
+    """Path to the policy checkpoint.  ``None`` or ``"default"`` resolves under
+    ``<task-project>/best_policy/`` — tries ``best.pt`` then ``best_policy.pt``."""
+
+    workflow: str = "rsl_rl"
+    """RL framework used to load the checkpoint: ``"rsl_rl"`` (default) or
+    ``"skrl"``. Must match how the task package was trained."""
+
+    runtime: str = "in_process"
+    """``in_process`` keeps the checkpoint path. ``brain`` talks to a brain socket."""
+
+    brain: dict[str, Any] | None = None
+    """Socket directory, step timeout, and open-loop horizon. Required for ``runtime: brain``."""
+
+    benchmark_env_id: str | None = None
+    """EnvHub id whose bundle contains ``benchmark.yaml``."""
+
+    # -----------------------------------------------------------------------
+    # Class methods
+    # -----------------------------------------------------------------------
+
+    @classmethod
+    def from_yaml(cls, config_path: str | Path) -> EvalConfig:
+        """Load configuration from a YAML file.
+
+        Args:
+            config_path: Path to the YAML configuration file.
+
+        Returns:
+            Validated ``EvalConfig`` instance.
+
+        Raises:
+            FileNotFoundError: If the config file does not exist.
+            ValueError: If ``task_type`` is absent from the YAML.
+        """
+        config_path = Path(config_path)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        with open(config_path, "r", encoding="utf-8", errors="replace") as f:
+            data = yaml.safe_load(f)
+
+        if "task_type" not in data:
+            raise ValueError(
+                f"Config file {config_path} is missing the required 'task_type' field "
+                f"(e.g. 'manipulation.multitask' or 'navigation.spot')."
+            )
+
+        config = cls(**data)
+        config._resolve_policy_path()
+        return config
+
+    # -----------------------------------------------------------------------
+    # Validation
+    # -----------------------------------------------------------------------
+
+    def validate(self) -> None:
+        """Validate all configuration parameters.
+
+        Raises:
+            ValueError: On any invalid field or invalid (task_type, scoring_version) combo.
+        """
+        if not self.task_name:
+            raise ValueError("task_name cannot be empty")
+
+        for i, env_scene in enumerate(self.env_scenes):
+            if not isinstance(env_scene, dict):
+                raise ValueError(f"env_scenes[{i}] must be a dictionary")
+            if "env_id" not in env_scene:
+                raise ValueError(f"env_scenes[{i}] must have 'env_id' key")
+            if "scene" not in env_scene:
+                raise ValueError(f"env_scenes[{i}] must have 'scene' key")
+
+        if not self.seeds:
+            raise ValueError("seeds list cannot be empty")
+
+        if self.num_episodes < 1:
+            raise ValueError("num_episodes must be >= 1")
+
+        if self.max_episode_steps is not None and self.max_episode_steps < 1:
+            raise ValueError("max_episode_steps must be >= 1 if specified")
+
+        if self.runtime != "brain" and (self.num_envs is None or self.num_envs < 1):
+            raise ValueError("num_envs must be >= 1")
+        if self.runtime == "brain" and self.num_envs is not None and self.num_envs < 1:
+            raise ValueError("num_envs must be >= 1")
+
+        # Raises ValueError for an unknown task type or version.
+        from ..core.scorers import get_scorer
+
+        get_scorer(self.task_type, self.scoring_version)
+
+        if not self.category:
+            raise ValueError("category cannot be empty")
+        if self.category not in ("navigation", "manipulation"):
+            raise ValueError(
+                f"Unsupported category: {self.category!r}. "
+                "Supported: ('navigation', 'manipulation')"
+            )
+
+        if self.max_episode_time_s is not None and self.max_episode_time_s <= 0:
+            raise ValueError("max_episode_time_s must be > 0 if specified")
+
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0 if specified")
+
+        if self.runtime not in ("in_process", "brain"):
+            raise ValueError(f"Unsupported runtime: {self.runtime!r}. Supported: ('in_process', 'brain')")
+
+        if self.runtime != "brain" and not self.env_scenes:
+            raise ValueError("env_scenes list cannot be empty")
+
+        if self.runtime == "in_process" and self.workflow not in ("rsl_rl", "skrl"):
+            raise ValueError(
+                f"Unsupported workflow: {self.workflow!r}. "
+                "Supported: ('rsl_rl', 'skrl')"
+            )
+
+        if self.runtime == "brain":
+            brain = self.brain or {}
+            for key in ("socket_dir", "step_timeout_s", "open_loop_horizon"):
+                if key not in brain:
+                    raise ValueError(f"brain.{key} is required when runtime is 'brain'")
+            if float(brain["step_timeout_s"]) <= 0:
+                raise ValueError("brain.step_timeout_s must be > 0")
+            if int(brain["open_loop_horizon"]) < 1:
+                raise ValueError("brain.open_loop_horizon must be >= 1")
+            placement = str(brain.get("placement", "paired"))
+            if placement not in ("paired", "split"):
+                raise ValueError("brain.placement must be 'paired' or 'split'")
+            if not self.benchmark_env_id:
+                raise ValueError("benchmark_env_id is required when runtime is 'brain'")
+
+    # -----------------------------------------------------------------------
+    # Serialization
+    # -----------------------------------------------------------------------
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert config to dictionary."""
+        return {
+            "task_name": self.task_name,
+            "task_module": self.task_module,
+            "task_type": self.task_type,
+            "scoring_version": self.scoring_version,
+            "env_scenes": self.env_scenes,
+            "seeds": self.seeds,
+            "num_episodes": self.num_episodes,
+            "max_episode_steps": self.max_episode_steps,
+            "max_episode_time_s": self.max_episode_time_s,
+            "env_config": self.env_config,
+            "num_envs": self.num_envs,
+            "category": self.category,
+            "enable_cameras": self.enable_cameras,
+            "timeout_seconds": self.timeout_seconds,
+            "log_dir": self.log_dir,
+            "enable_logging": self.enable_logging,
+            "policy_path": self.policy_path,
+            "workflow": self.workflow,
+            "runtime": self.runtime,
+            "brain": self.brain,
+            "benchmark_env_id": self.benchmark_env_id,
+        }
+
+    # -----------------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------------
+
+    def _resolve_policy_path(self) -> None:
+        """Resolve ``policy_path`` to an actual file path when set to default."""
+        if self.policy_path is None or self.policy_path == "default":
+            task_project_dir = self._find_task_project_folder()
+            if task_project_dir:
+                candidates = [
+                    task_project_dir / "best_policy" / "best.pt",
+                    task_project_dir / "best_policy" / "best_policy.pt",
+                ]
+                for path in candidates:
+                    if path.is_file():
+                        self.policy_path = str(path)
+                        return
+                self.policy_path = None
+            else:
+                self.policy_path = None
+
+    def _find_task_project_folder(self) -> Path | None:
+        """Walk up from ``task_module``'s file to find the task project root.
+
+        Matches directories named ``task-*`` (e.g. task-leatherback-lidar) or
+        ``task_*`` (e.g. task_humanoid_running).
+        """
+        if not self.task_module:
+            return None
+        try:
+            module = importlib.import_module(self.task_module)
+            if hasattr(module, "__file__") and module.__file__:
+                current = Path(module.__file__).parent
+                for _ in range(10):
+                    name = current.name
+                    if name.startswith("task-") or name.startswith("task_"):
+                        return current
+                    parent = current.parent
+                    if parent == current:
+                        break
+                    current = parent
+        except ImportError:
+            pass
+        return None
