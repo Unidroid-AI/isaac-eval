@@ -10,6 +10,9 @@ The config selects the path. ``runtime: brain`` loads the EnvHub bundle and
 starts one Isaac process per GPU. Any other runtime starts Isaac in this
 process and runs the checkpoint evaluator.
 
+``--bundle-dir`` (or ``$ISAAC_EVAL_BUNDLE_DIR``) uses an already extracted
+bundle, such as a BenchHub mount at ``/benchmark/<id>``, instead of the Nepher cache.
+
 The per-GPU process is ``evaluate.py --worker``. It is not a separate command.
 """
 
@@ -60,8 +63,19 @@ def _run_checkpoint() -> None:
         default=None,
         help="Absolute path for evaluation_result.json output (default: cwd)",
     )
+    parser.add_argument(
+        "--bundle-dir",
+        type=str,
+        default=None,
+        help="Extracted EnvHub bundle to use instead of the Nepher cache (or $ISAAC_EVAL_BUNDLE_DIR)",
+    )
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()
+    from isaac_eval.benchmark.bundle import bundle_dir_arg, mount_bundle
+
+    bundle = bundle_dir_arg(args_cli.bundle_dir)
+    if bundle is not None:
+        mount_bundle(bundle)
     # Lab 3 dropped the --enable_cameras flag. The launcher still reads the attribute.
     if _config_enables_cameras(args_cli.config):
         args_cli.enable_cameras = True

@@ -43,6 +43,16 @@ The config picks the runtime. `runtime: brain` starts one Isaac process per GPU 
 
 Campaign configs live in [configs/](configs/).
 
+### Pre-fetched bundles
+
+By default the benchmark environment comes from the Nepher cache, which downloads it from EnvHub. A validator that fetched the benchmark from Unidroid BenchHub passes the extracted bundle instead:
+
+```bash
+isaac-eval --config configs/task-franka-tabletop-v13.yaml --viz none --bundle-dir /benchmark/franka-tabletop
+```
+
+`ISAAC_EVAL_BUNDLE_DIR` works the same way. The bundle must hold the EnvHub `manifest.yaml`, and its `id` must match `benchmark_env_id` in the config. Nothing is downloaded and no Nepher API key is needed. A read-only mount is fine: if the folder is not named after the env id, a symlink under a temporary cache directory points to it.
+
 ## Results
 
 ```

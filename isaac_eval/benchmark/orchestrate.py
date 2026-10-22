@@ -26,6 +26,7 @@ from pathlib import Path
 import yaml
 
 from isaac_eval.benchmark.aggregate import score_records, write_outputs
+from isaac_eval.benchmark.bundle import BUNDLE_DIR_ENV, bundle_dir_arg, mount_bundle
 from isaac_eval.benchmark.expand import expand, make_shards
 from isaac_eval.benchmark.manifest import load_manifest
 from isaac_eval.benchmark.packing import pack_key_for
@@ -38,12 +39,17 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Evaluate a brain submission")
     parser.add_argument("--config", required=True)
     parser.add_argument("--manifest", default=None, help="Override the bundle's benchmark.yaml.")
+    parser.add_argument("--bundle-dir", default=None,
+                        help=f"Extracted EnvHub bundle to use instead of the Nepher cache (or ${BUNDLE_DIR_ENV}).")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--result-path", default=None)
     args, _unknown = parser.parse_known_args(argv)
 
     config = EvalConfig.from_yaml(args.config)
     config.validate()
+    bundle = bundle_dir_arg(args.bundle_dir)
+    if bundle is not None:
+        mount_bundle(bundle, config.benchmark_env_id)
     manifest_path = Path(args.manifest) if args.manifest else _manifest_from_envhub(config)
     manifest = load_manifest(manifest_path)
     output_dir = _output_dir(args.output_dir, config.log_dir)
