@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -94,7 +95,7 @@ def load_manifest(path: str | Path) -> BenchmarkManifest:
 
 def manifest_from_dict(data: dict[str, Any], bundle_dir: str | Path | None = None) -> BenchmarkManifest:
     """Build a manifest from a parsed mapping."""
-    tasks = [_task(item) for item in data["tasks"]]
+    tasks = [_task(item, None if bundle_dir is None else Path(bundle_dir)) for item in data["tasks"]]
     manifest = BenchmarkManifest(
         version=str(data["version"]),
         shard_size=int(data["shard_size"]),
@@ -110,14 +111,18 @@ def manifest_from_dict(data: dict[str, Any], bundle_dir: str | Path | None = Non
     return manifest
 
 
-def _task(item: dict[str, Any]) -> TaskRequest:
+def _task(item: dict[str, Any], bundle_dir: Path | None) -> TaskRequest:
+    instruction = str(item.get("instruction", ""))
     if "scene" in item:
         scene_id = str(item["scene"])
         scenes = [SceneRequest(composer=scene_id, count=1, scene_id=scene_id)]
         if "success" not in item:
             raise ValueError(f"task {item.get('task_id')} is missing success")
-        if not item.get("instruction"):
+        if not instruction:
             raise ValueError(f"task {item.get('task_id')} is missing instruction")
+    elif "scenes" not in item:
+        scene_id, instruction = _scene_binding(bundle_dir, str(item["task_id"]))
+        scenes = [SceneRequest(composer=scene_id, count=1, scene_id=scene_id)]
     else:
         scenes = []
         for scene in item["scenes"]:
@@ -145,9 +150,40 @@ def _task(item: dict[str, Any]) -> TaskRequest:
         scenes=scenes,
         variants=variants,
         instruction_pool=str(item.get("instruction_pool", "")),
-        instruction=str(item.get("instruction", "")),
+        instruction=instruction,
         success=success,
     )
+
+
+def _scene_binding(bundle_dir: Path | None, task_id: str) -> tuple[str, str]:
+    """Return ``(scene_id, instruction)`` from the one scene file for ``task_id``.
+
+    A benchmark entry that names only ``task_id`` keeps its scene, instruction, and success
+    check in ``scenes/<task_id>-<scene_id>.json``.
+
+    Raises:
+        ValueError: The bundle is unknown, the scene file is missing or duplicated, or it
+            omits ``scene_id`` or ``instruction``.
+    """
+    if bundle_dir is None:
+        raise ValueError(f"task {task_id} names no scene, and the bundle directory is unknown")
+    matches = sorted((bundle_dir / "scenes").glob(f"{task_id}-*.json"))
+    if len(matches) != 1:
+        raise ValueError(
+            f"task {task_id} needs one scene file under {bundle_dir / 'scenes'}, found {len(matches)}"
+        )
+    payload = json.loads(matches[0].read_text(encoding="utf-8"))
+    scene_id = payload.get("scene_id")
+    instruction = payload.get("instruction")
+    if str(payload.get("task_id", "")) != task_id:
+        raise ValueError(f"{matches[0].name} belongs to task {payload.get('task_id')!r}, not {task_id!r}")
+    if not isinstance(scene_id, str) or not scene_id:
+        raise ValueError(f"{matches[0].name} is missing scene_id")
+    if matches[0].name != f"{task_id}-{scene_id}.json":
+        raise ValueError(f"{matches[0].name} does not match scene_id {scene_id!r}")
+    if not isinstance(instruction, str) or not instruction:
+        raise ValueError(f"{matches[0].name} is missing instruction")
+    return scene_id, instruction
 
 
 def _success(block: dict[str, Any] | None) -> SuccessSpec | None:

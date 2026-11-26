@@ -87,17 +87,29 @@ def test_authored_task_is_one_nominal_episode():
     assert manifest.tasks[0].success.kind == "item_in_container"
 
 
-def test_phase_bundles_are_sixteen_distinct_tasks():
-    root = SOURCE / "envhub" / "environments"
+def test_phase_bundles_are_disjoint_sixty_task_slices():
+    """v0 and v1 each expand to 60 episodes, with 30 of each of the two domes."""
+    import pytest
+
     seen: list[set[str]] = []
     for name in ("franka-tabletop-v0", "franka-tabletop-v1"):
-        manifest = load_manifest(root / name / "benchmark.yaml")
+        root = _envhub_bundle(name)
+        if root is None:
+            pytest.skip(f"{name} is not checked out")
+        manifest = load_manifest(root / "benchmark.yaml")
         jobs = expand(manifest)
         task_ids = {job.task_id for job in jobs}
-        assert len(jobs) == 16
-        assert len(task_ids) == 16
+        assert len(jobs) == 60
+        assert len(task_ids) == 60
         assert {job.variant for job in jobs} == {"nominal"}
         assert {job.pose_jitter_m for job in jobs} == {0.0}
+        backgrounds = []
+        for job in jobs:
+            scene = json.loads((root / "scenes" / f"{job.task_id}-{job.scene_id}.json").read_text(encoding="utf-8"))
+            assert scene["instruction"] == job.instruction
+            backgrounds.append(scene["background"])
+        assert backgrounds.count("home_office") == 30
+        assert backgrounds.count("brown_photostudio") == 30
         seen.append(task_ids)
     assert seen[0].isdisjoint(seen[1])
 
@@ -286,6 +298,75 @@ def test_multitask_clips_a_late_jerky_success():
     assert scorer.tasks["place_relative"]["speed"] == 0.0
     assert scorer.tasks["place_relative"]["smoothness"] == 0.0
     assert abs(score - 0.70) < 1e-9
+
+
+def test_task_id_alone_reads_the_scene_file(tmp_path: Path):
+    """An index entry with only ``task_id`` keeps the job id of the authored form."""
+    instruction = "Pick up the banana and place it in the bowl"
+    _scene_file(tmp_path, "banana_in_bowl", "banana_bowl", instruction=instruction)
+    header = {"version": "franka-tabletop-v0", "shard_size": 4, "seed_salt": "phase1"}
+    authored = manifest_from_dict(
+        {
+            **header,
+            "tasks": [
+                {
+                    "task_id": "banana_in_bowl",
+                    "scene": "banana_bowl",
+                    "instruction": instruction,
+                    "success": {"op": "in_container", "objects": ["banana"], "container": "bowl"},
+                }
+            ],
+        },
+        bundle_dir=tmp_path,
+    )
+    indexed = manifest_from_dict({**header, "tasks": [{"task_id": "banana_in_bowl"}]}, bundle_dir=tmp_path)
+    assert indexed.tasks[0].success is None
+    assert expand(indexed)[0] == expand(authored)[0]
+
+
+def test_task_id_alone_needs_one_scene_file(tmp_path: Path):
+    import pytest
+
+    header = {"version": "v", "shard_size": 1, "seed_salt": "x", "tasks": [{"task_id": "banana_in_bowl"}]}
+    with pytest.raises(ValueError, match="one scene file"):
+        manifest_from_dict(header, bundle_dir=tmp_path)
+    _scene_file(tmp_path, "banana_in_bowl", "banana_bowl")
+    _scene_file(tmp_path, "banana_in_bowl", "other_bowl")
+    with pytest.raises(ValueError, match="one scene file"):
+        manifest_from_dict(header, bundle_dir=tmp_path)
+
+
+def _envhub_bundle(name: str) -> Path | None:
+    """Bundle checkout next to isaac-eval, or next to the unidroid directory."""
+    for root in (SOURCE, SOURCE.parent):
+        path = root / "envhub" / "environments" / name
+        if (path / "benchmark.yaml").is_file():
+            return path
+    return None
+
+
+def test_v13_index_keeps_the_scene_file_episodes():
+    """v13 names tasks only. Scene, instruction, and the success check stay in the scene file."""
+    import pytest
+
+    root = _envhub_bundle("franka-tabletop-v13")
+    if root is None:
+        pytest.skip("franka-tabletop-v13 is not checked out")
+    path = root / "benchmark.yaml"
+    manifest = load_manifest(path)
+    jobs = expand(manifest)
+    assert len(jobs) == 120
+    assert all(task.success is None for task in manifest.tasks)
+    assert jobs[0].task_id == "animals_in_bin"
+    assert jobs[0].scene_id == "toys_cleanup"
+    assert jobs[0].instruction == "Put the lizards in the bin"
+    assert jobs[0].job_id == "dbb77140d419d1c67d3dba049564b8993a90efef0d76a7e7c50ab606fa6f32f2"
+    assert jobs[0].seed == 1520173337
+    for job in jobs:
+        scene = json.loads((root / "scenes" / f"{job.task_id}-{job.scene_id}.json").read_text(encoding="utf-8"))
+        assert scene["instruction"] == job.instruction
+        assert scene["scene_id"] == job.scene_id
+        assert "success" in scene
 
 
 def test_kind_free_success_block_loads():
