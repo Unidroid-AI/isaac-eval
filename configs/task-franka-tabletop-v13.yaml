@@ -3,7 +3,7 @@
 # (benchmark.yaml: pack_by: background, shard_size: 16). Scores are not comparable with v12.
 # The phase bundle is hidden; this file only names it.
 
-task_name: "Nepher-FrankaTabletop-Envhub-Play-v0"
+task_name: "Unidroid-FrankaTabletop-Envhub-Play-v0"
 task_module: "franka_tabletop.tasks"
 task_type: "manipulation.multitask"
 scoring_version: "v1"

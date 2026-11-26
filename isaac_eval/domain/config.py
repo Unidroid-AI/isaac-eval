@@ -66,7 +66,7 @@ class EvalConfig:
     # -----------------------------------------------------------------------
 
     task_name: str
-    """Gymnasium task name (e.g. 'Nepher-FrankaTabletop-Envhub-Play-v0')."""
+    """Gymnasium task name (e.g. 'Unidroid-FrankaTabletop-Envhub-Play-v0')."""
 
     task_type: str
     """Task domain that selects the scorer family (see the class docstring)."""

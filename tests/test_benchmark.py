@@ -460,7 +460,7 @@ def test_evaluation_summary_lists_task_terms(tmp_path: Path):
 def test_brain_config_requires_brain_fields(tmp_path: Path):
     path = tmp_path / "eval.yaml"
     path.write_text(
-        "task_name: Nepher-FrankaTabletop-Envhub-Play-v0\n"
+        "task_name: Unidroid-FrankaTabletop-Envhub-Play-v0\n"
         "task_type: manipulation.multitask\n"
         "scoring_version: v1\n"
         "category: manipulation\n"
@@ -478,7 +478,7 @@ def test_brain_config_requires_brain_fields(tmp_path: Path):
         raise AssertionError("brain config without fields should fail validation")
 
     path.write_text(
-        "task_name: Nepher-FrankaTabletop-Envhub-Play-v0\n"
+        "task_name: Unidroid-FrankaTabletop-Envhub-Play-v0\n"
         "task_type: manipulation.multitask\n"
         "scoring_version: v1\n"
         "category: manipulation\n"
