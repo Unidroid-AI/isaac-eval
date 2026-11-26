@@ -71,11 +71,11 @@ def _run_checkpoint() -> None:
     )
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()
-    from isaac_eval.benchmark.bundle import bundle_dir_arg, mount_bundle
+    from isaac_eval.benchmark.bundle import mount_bundle, resolve_bundle_dir
 
-    bundle = bundle_dir_arg(args_cli.bundle_dir)
+    bundle = resolve_bundle_dir(args_cli.bundle_dir)
     if bundle is not None:
-        mount_bundle(bundle)
+        mount_bundle(bundle, strict_env_id=False)
     # Lab 3 dropped the --enable_cameras flag. The launcher still reads the attribute.
     if _config_enables_cameras(args_cli.config):
         args_cli.enable_cameras = True

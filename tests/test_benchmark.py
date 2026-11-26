@@ -515,6 +515,24 @@ def test_plan_slots_splits_extra_gpus_into_brains(monkeypatch):
     assert [(slot.device_id, slot.brain_index) for slot in slots] == [("2", 0), ("3", 1)]
 
 
+def test_plan_slots_caps_workers_to_available_brain_sockets(monkeypatch, tmp_path: Path):
+    socket_dir = tmp_path / "brain"
+    socket_dir.mkdir()
+    (socket_dir / "brain-0.sock").write_text("", encoding="utf-8")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    assert [(s.device_id, s.brain_index) for s in plan_slots("paired", socket_dir=socket_dir)] == [("0", 0)]
+    assert [(s.device_id, s.brain_index) for s in plan_slots("split", socket_dir=socket_dir)] == [("1", 0)]
+    (socket_dir / "brain-1.sock").write_text("", encoding="utf-8")
+    assert [(s.device_id, s.brain_index) for s in plan_slots("paired", socket_dir=socket_dir)] == [
+        ("0", 0),
+        ("1", 1),
+    ]
+    assert [(s.device_id, s.brain_index) for s in plan_slots("split", socket_dir=socket_dir)] == [
+        ("2", 0),
+        ("3", 1),
+    ]
+
+
 def test_lockstep_hashes_match_across_runs():
     shard = make_shards(expand(manifest_from_dict(MANIFEST)), 2)[0]
     first = run_shard(_FakeEnv(len(shard.jobs)), _ZeroRuntime(), shard, open_loop_horizon=2, max_steps=4)

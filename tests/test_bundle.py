@@ -15,7 +15,15 @@ from pathlib import Path
 
 import pytest
 
-from isaac_eval.benchmark.bundle import BUNDLE_DIR_ENV, bundle_dir_arg, mount_bundle
+from isaac_eval.benchmark.bundle import (
+    BUNDLE_DIR_ENV,
+    EXIT_CONFIG_ERROR,
+    UNIDROID_CACHE_ENV,
+    bundle_dir_arg,
+    bundle_root_of,
+    mount_bundle,
+    resolve_bundle_dir,
+)
 
 ENV_ID = "franka-tabletop-v13"
 
@@ -24,6 +32,7 @@ ENV_ID = "franka-tabletop-v13"
 def _restore_nepher_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("NEPHER_CACHE_DIR", raising=False)
     monkeypatch.delenv(BUNDLE_DIR_ENV, raising=False)
+    monkeypatch.delenv(UNIDROID_CACHE_ENV, raising=False)
 
 
 def make_bundle(path: Path, env_id: str = ENV_ID) -> Path:
@@ -84,3 +93,34 @@ def test_nepher_loads_the_mounted_bundle_offline(tmp_path: Path):
     loaded = json.loads(out.stdout.strip().splitlines()[-1])
     assert loaded["id"] == ENV_ID
     assert Path(loaded["path"]).resolve() == bundle.resolve()
+
+
+def test_resolve_bundle_dir_uses_unidroid_cli_cache_and_unwraps_single_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    cache_dir = tmp_path / "bench-cache"
+    monkeypatch.setenv(UNIDROID_CACHE_ENV, str(cache_dir))
+    wrapped = make_bundle(cache_dir / "franka-tabletop" / "bundle" / ENV_ID, env_id=ENV_ID)
+    resolved = resolve_bundle_dir(None, "franka-tabletop")
+    assert resolved == wrapped.resolve()
+    assert bundle_root_of(cache_dir / "franka-tabletop" / "bundle") == wrapped.resolve()
+
+
+def test_benchhub_alias_env_id_is_accepted_when_strict_is_false(tmp_path: Path):
+    bundle = make_bundle(tmp_path / "benchmark" / "franka-tabletop", env_id=ENV_ID)
+    assert mount_bundle(bundle, "franka-tabletop", strict_env_id=False) == ENV_ID
+    if can_symlink(tmp_path):
+        cache = Path(os.environ["NEPHER_CACHE_DIR"])
+        assert (cache / ENV_ID / "benchmark.yaml").is_file()
+        assert (cache / "franka-tabletop" / "benchmark.yaml").is_file()
+
+
+def test_orchestrate_exits_with_config_error_code_before_workers(tmp_path: Path):
+    from isaac_eval.benchmark.orchestrate import main
+
+    bad_cfg = tmp_path / "bad.yaml"
+    bad_cfg.write_text("runtime: brain\ntask_type: manipulation.multitask\ntask_name: ''\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        main(["--config", str(bad_cfg)])
+    assert exc.value.code == EXIT_CONFIG_ERROR
+

@@ -8,13 +8,17 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 
 from .expand import Shard
+
+_BRAIN_SOCK_RE = re.compile(r"^brain-(\d+)\.sock$")
 
 
 @dataclass(frozen=True)
@@ -34,22 +38,61 @@ def visible_device_ids() -> list[str]:
     return [str(index) for index in range(_nvidia_gpu_count())]
 
 
-def plan_slots(placement: str = "paired") -> list[WorkerSlot]:
+def discover_brain_indices(socket_dir: str | Path | None) -> list[int] | None:
+    """Return sorted replica indices present as ``brain-<n>.sock`` in ``socket_dir``, or None if absent."""
+    if not socket_dir:
+        return None
+    directory = Path(socket_dir)
+    if not directory.is_dir():
+        return None
+    indices: list[int] = []
+    try:
+        for entry in directory.iterdir():
+            match = _BRAIN_SOCK_RE.match(entry.name)
+            if match is not None:
+                indices.append(int(match.group(1)))
+    except OSError:
+        return None
+    return sorted(set(indices)) if indices else None
+
+
+def plan_slots(placement: str = "paired", socket_dir: str | Path | None = None) -> list[WorkerSlot]:
     """Isaac workers for one machine.
 
     ``paired`` puts worker ``i`` on GPU ``i`` with ``brain-i.sock``. One GPU is one
     worker and one brain. ``split`` keeps that pairing when only one GPU is visible.
     With two or more, the first half are brains and the rest are Isaac workers that
     round-robin across those brains.
+
+    When ``socket_dir`` already contains ``brain-<n>.sock`` listeners (e.g. inside the
+    validator sandbox), worker slots are bounded to the live brain replicas so a
+    multi-GPU host running fewer brain replicas never hangs waiting on a non-existent
+    socket or blocks behind a single-session replica.
     """
     ids = visible_device_ids()
+    available = discover_brain_indices(socket_dir)
     if placement == "split" and len(ids) >= 2:
+        if available:
+            brain_gpu_count = min(len(available), max(1, len(ids) // 2))
+            sim_ids = ids[brain_gpu_count:] or [ids[-1]]
+            active_sims = sim_ids[: len(available)]
+            return [
+                WorkerSlot(device_id=device_id, brain_index=available[index % len(available)])
+                for index, device_id in enumerate(active_sims)
+            ]
         brain_count = max(1, len(ids) // 2)
         sim_ids = ids[brain_count:]
         return [
             WorkerSlot(device_id=device_id, brain_index=index % brain_count)
             for index, device_id in enumerate(sim_ids)
         ]
+    if available:
+        paired = [
+            WorkerSlot(device_id=ids[pos], brain_index=brain_index)
+            for pos, brain_index in enumerate(available)
+            if pos < len(ids)
+        ]
+        return paired or [WorkerSlot(device_id=ids[0], brain_index=available[0])]
     return [WorkerSlot(device_id=device_id, brain_index=index) for index, device_id in enumerate(ids)]
 
 

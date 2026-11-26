@@ -77,6 +77,8 @@ def main() -> None:
             scene_id = first["scene_id"]
             print(f"[INFO] scene {task_id} / {scene_id} ({num_envs} envs)", flush=True)
             extra = {"observation": observation} if observation is not None and _accepts(cfg_cls, "observation") else {}
+            if payload.get("bundle_path") and _accepts(cfg_cls, "bundle_path"):
+                extra["bundle_path"] = payload["bundle_path"]
             if first.get("mixed"):
                 if not _accepts(cfg_cls, "scenes"):
                     raise RuntimeError(f"{payload['cfg_entry']} cannot build a stage with different objects per env")

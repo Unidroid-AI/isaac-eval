@@ -26,7 +26,12 @@ from pathlib import Path
 import yaml
 
 from isaac_eval.benchmark.aggregate import score_records, write_outputs
-from isaac_eval.benchmark.bundle import BUNDLE_DIR_ENV, bundle_dir_arg, mount_bundle
+from isaac_eval.benchmark.bundle import (
+    BUNDLE_DIR_ENV,
+    EXIT_CONFIG_ERROR,
+    mount_bundle,
+    resolve_bundle_dir,
+)
 from isaac_eval.benchmark.expand import expand, make_shards
 from isaac_eval.benchmark.manifest import load_manifest
 from isaac_eval.benchmark.packing import pack_key_for
@@ -45,16 +50,28 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--result-path", default=None)
     args, _unknown = parser.parse_known_args(argv)
 
-    config = EvalConfig.from_yaml(args.config)
-    config.validate()
-    bundle = bundle_dir_arg(args.bundle_dir)
-    if bundle is not None:
-        mount_bundle(bundle, config.benchmark_env_id)
-    manifest_path = Path(args.manifest) if args.manifest else _manifest_from_envhub(config)
-    manifest = load_manifest(manifest_path)
+    try:
+        config = EvalConfig.from_yaml(args.config)
+        config.validate()
+        bundle = resolve_bundle_dir(args.bundle_dir, config.benchmark_env_id)
+        if bundle is not None:
+            mount_bundle(bundle, config.benchmark_env_id, strict_env_id=False)
+        if args.manifest:
+            manifest_path = Path(args.manifest)
+        elif bundle is not None:
+            manifest_path = bundle / "benchmark.yaml"
+            if not manifest_path.is_file():
+                raise FileNotFoundError(f"bundle {bundle} has no benchmark.yaml")
+        else:
+            manifest_path = _manifest_from_envhub(config)
+        manifest = load_manifest(manifest_path)
+    except (FileNotFoundError, ValueError, TypeError, KeyError, yaml.YAMLError) as exc:
+        print(f"[CONFIG ERROR] {exc}", file=sys.stderr, flush=True)
+        sys.exit(EXIT_CONFIG_ERROR)
+
     output_dir = _output_dir(args.output_dir, config.log_dir)
     started = time.perf_counter()
-    records = run_workers(config, manifest, output_dir)
+    records = run_workers(config, manifest, output_dir, bundle_dir=bundle)
     print(wall_summary(records), flush=True)
     score, metrics, report = score_records(
         records,
@@ -136,7 +153,7 @@ def _write_config(output_dir: Path, config: EvalConfig) -> None:
         yaml.dump(config.to_dict(), handle, default_flow_style=False, allow_unicode=True)
 
 
-def run_workers(config: EvalConfig, manifest, output_dir: Path) -> list[dict]:
+def run_workers(config: EvalConfig, manifest, output_dir: Path, *, bundle_dir: Path | None = None) -> list[dict]:
     """Expand, schedule, and collect JSONL records.
 
     Units of work sit in one queue. Each GPU takes the next unit when it is idle,
@@ -146,7 +163,8 @@ def run_workers(config: EvalConfig, manifest, output_dir: Path) -> list[dict]:
     shards = make_shards(jobs, manifest.shard_size, pack_key_for(manifest), mixed=manifest.pack_by == "background")
     groups = group_shards(shards)
     placement = str((config.brain or {}).get("placement", "paired"))
-    slots = plan_slots(placement)
+    socket_dir = (config.brain or {}).get("socket_dir")
+    slots = plan_slots(placement, socket_dir=socket_dir)
     units = plan_units(groups, len(slots))
     output_dir.mkdir(parents=True, exist_ok=True)
     active = slots[: len(units)]
@@ -165,12 +183,20 @@ def run_workers(config: EvalConfig, manifest, output_dir: Path) -> list[dict]:
         with counter_lock:
             number = next(counter)
         path = output_dir / f"gpu{slot.device_id}-{number:03d}.jsonl"
-        return _run_process(config, unit, path, slot, deadline)
+        return _run_process(config, unit, path, slot, deadline, bundle_dir=bundle_dir)
 
     return run_queue(active, units, run_unit)
 
 
-def _run_process(config: EvalConfig, bucket, output_path: Path, slot, deadline: float | None = None) -> list[dict]:
+def _run_process(
+    config: EvalConfig,
+    bucket,
+    output_path: Path,
+    slot,
+    deadline: float | None = None,
+    *,
+    bundle_dir: Path | None = None,
+) -> list[dict]:
     """One Isaac process for one unit of scene groups.
 
     Raises:
@@ -189,6 +215,7 @@ def _run_process(config: EvalConfig, bucket, output_path: Path, slot, deadline: 
         "task_name": config.task_name,
         "cfg_entry": (config.env_config or {}).get("cfg_entry"),
         "benchmark_env_id": config.benchmark_env_id,
+        "bundle_path": str(bundle_dir) if bundle_dir is not None else None,
         "open_loop_horizon": int(config.brain["open_loop_horizon"]) if config.brain else 1,
         "step_timeout_s": float(config.brain["step_timeout_s"]) if config.brain else 30,
         "max_steps": _step_cap(config),
