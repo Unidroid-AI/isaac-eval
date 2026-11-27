@@ -53,6 +53,8 @@ isaac-eval --config configs/task-franka-tabletop-v13.yaml --viz none --bundle-di
 
 `ISAAC_EVAL_BUNDLE_DIR` works the same way. The bundle must hold the EnvHub `manifest.yaml`, and its `id` must match `benchmark_env_id` in the config. Nothing is downloaded and no Nepher API key is needed. A read-only mount is fine: if the folder is not named after the env id, a symlink under a temporary cache directory points to it.
 
+The bundle does not have to exist on EnvHub. A benchmark uploaded to BenchHub with `format: isaac-eval` in its `manifest.yaml` is the same kind of bundle (`manifest.yaml` with `id` equal to the benchmark id, `benchmark.yaml`, and the task's assets), and the validator mounts it the same way. To try one locally, `udcli bench download <id>` and pass `--bundle-dir ~/.unidroid/bench-cache/<id>/bundle`. Without a bundle directory and without a cached copy, `isaac-eval` falls back to `nepher.load_env(<benchmark_env_id>)`, which only finds environments published on EnvHub.
+
 ## Results
 
 ```
